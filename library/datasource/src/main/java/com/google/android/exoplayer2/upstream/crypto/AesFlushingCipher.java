@@ -18,6 +18,7 @@ package com.google.android.exoplayer2.upstream.crypto;
 import androidx.annotation.Nullable;
 import com.google.android.exoplayer2.util.Assertions;
 import com.google.android.exoplayer2.util.Util;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
@@ -42,6 +43,30 @@ public final class AesFlushingCipher {
   private final byte[] flushedBlock;
 
   private int pendingXorBytes;
+
+  public AesFlushingCipher(int mode, byte[] secretKey, byte[] iv, long offset) {
+    try {
+      cipher = Cipher.getInstance("AES/CTR/NoPadding");
+      blockSize = cipher.getBlockSize();
+      zerosBlock = new byte[blockSize];
+      flushedBlock = new byte[blockSize];
+      long counter = offset / blockSize;
+      int startPadding = (int) (offset % blockSize);
+      cipher.init(
+          mode,
+          new SecretKeySpec(secretKey, Util.splitAtFirst(cipher.getAlgorithm(), "/")[0]),
+          new IvParameterSpec(getCounterBlock(iv, counter)));
+      if (startPadding != 0) {
+        updateInPlace(new byte[startPadding], 0, startPadding);
+      }
+    } catch (NoSuchAlgorithmException
+        | NoSuchPaddingException
+        | InvalidKeyException
+        | InvalidAlgorithmParameterException e) {
+      // Should never happen.
+      throw new RuntimeException(e);
+    }
+  }
 
   public AesFlushingCipher(int mode, byte[] secretKey, @Nullable String nonce, long offset) {
     this(mode, secretKey, getFNV64Hash(nonce), offset);
@@ -125,6 +150,41 @@ public final class AesFlushingCipher {
 
   private byte[] getInitializationVector(long nonce, long counter) {
     return ByteBuffer.allocate(16).putLong(nonce).putLong(counter).array();
+  }
+
+  /**
+   * Get Counter Block using by iv and counter. 1. To easily add iv and counter, convert to
+   * BigInteger with signum as 1 which makes it unsigned. 2. Add two BigIntegers and Convert to
+   * ByteArray. It could be over 16 byte(due to carry) or could be less 16 bytes(due to small). 3.
+   * Adjust the bytearray length to 16 byte.
+   *
+   * @param iv      Initialization Vector. it should be 16 bytes array
+   * @param counter Counter indicating the number of blocks
+   */
+
+  private byte[] getCounterBlock(byte[] iv, long counter) {
+    if (iv.length != 16) {
+      return iv; // throw exception iv's length should be 16
+    }
+    byte[] counterArr = ByteBuffer.allocate(8).putLong(counter).array();
+
+    BigInteger bigIntegerIV = new BigInteger(1, iv);
+    BigInteger bigIntegerCounter = new BigInteger(1, counterArr);
+    byte[] counterBlock = bigIntegerIV.add(bigIntegerCounter).toByteArray();
+    return adjustByteArray(counterBlock);
+  }
+
+  private byte[] adjustByteArray(byte[] bytes) {
+    ByteBuffer byteBuffer = ByteBuffer.allocate(16);
+    if (bytes.length < 16) {
+      for (int i = 0; i < 16 - bytes.length; i++) {
+        byteBuffer.put((byte) 0x00);
+      }
+      byteBuffer.put(bytes);
+    } else {
+      byteBuffer.put(bytes, bytes.length - 16, 16);
+    }
+    return byteBuffer.array();
   }
 
   /**
